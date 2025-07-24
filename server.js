@@ -1,57 +1,56 @@
 const express = require('express');
 const { Pool } = require('pg');
-const OpenAI = require('openai');
 
 const app = express();
 app.use(express.json());
 app.use(express.static('.'));
 
-const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+// Simple health check
+app.get('/health', (req, res) => {
+    res.json({ status: 'OK', message: 'OSINT Terminal is running!' });
 });
 
-const openai = new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY
-});
-
-async function initDB() {
-    try {
-        await pool.query(`
-            CREATE TABLE IF NOT EXISTS visitors (
-                visitor_id UUID PRIMARY KEY,
-                fp_hash TEXT,
-                ip TEXT,
-                city TEXT,
-                country TEXT,
-                lat NUMERIC,
-                lon NUMERIC,
-                user_agent TEXT,
-                first_seen TIMESTAMPTZ DEFAULT now(),
-                last_seen TIMESTAMPTZ DEFAULT now()
-            )
-        `);
-        
-        await pool.query(`
-            CREATE TABLE IF NOT EXISTS conversations (
-                id SERIAL PRIMARY KEY,
-                visitor_id UUID REFERENCES visitors,
-                ts TIMESTAMPTZ DEFAULT now(),
-                prompt TEXT,
-                answer TEXT
-            )
-        `);
-        
-        console.log('Database initialized');
-    } catch (error) {
-        console.error('Database initialization error:', error);
-    }
+// Only initialize DB if we have DATABASE_URL
+let pool;
+if (process.env.DATABASE_URL) {
+    pool = new Pool({
+        connectionString: process.env.DATABASE_URL,
+        ssl: { rejectUnauthorized: false }
+    });
+    
+    // Initialize database tables
+    pool.query(`
+        CREATE TABLE IF NOT EXISTS visitors (
+            visitor_id UUID PRIMARY KEY,
+            fp_hash TEXT,
+            ip TEXT,
+            city TEXT,
+            country TEXT,
+            lat NUMERIC,
+            lon NUMERIC,
+            user_agent TEXT,
+            first_seen TIMESTAMPTZ DEFAULT now(),
+            last_seen TIMESTAMPTZ DEFAULT now()
+        )
+    `).catch(err => console.log('Table might already exist:', err.message));
+    
+    pool.query(`
+        CREATE TABLE IF NOT EXISTS conversations (
+            id SERIAL PRIMARY KEY,
+            visitor_id UUID REFERENCES visitors,
+            ts TIMESTAMPTZ DEFAULT now(),
+            prompt TEXT,
+            answer TEXT
+        )
+    `).catch(err => console.log('Table might already exist:', err.message));
 }
-
-initDB();
 
 app.post('/session', async (req, res) => {
     const { visitor_id, fpHash, geo, userAgent } = req.body;
+    
+    if (!pool) {
+        return res.json({ success: true, message: 'No database configured' });
+    }
     
     try {
         await pool.query(`
@@ -60,44 +59,53 @@ app.post('/session', async (req, res) => {
             ON CONFLICT (visitor_id) 
             DO UPDATE SET 
                 last_seen = now(),
-                fp_hash = EXCLUDED.fp_hash,
-                ip = EXCLUDED.ip,
-                city = EXCLUDED.city,
-                country = EXCLUDED.country,
-                lat = EXCLUDED.lat,
-                lon = EXCLUDED.lon,
-                user_agent = EXCLUDED.user_agent
-        `, [visitor_id, fpHash, geo.query, geo.city, geo.country, geo.lat, geo.lon, userAgent]);
+                fp_hash = EXCLUDED.fp_hash
+        `, [visitor_id, fpHash, geo.query || 'unknown', geo.city || 'unknown', 
+            geo.country || 'unknown', geo.lat || 0, geo.lon || 0, userAgent || 'unknown']);
         
         res.json({ success: true });
     } catch (error) {
-        console.error(error);
-        res.status(500).json({ error: 'Session creation failed' });
+        console.error('Session error:', error);
+        res.json({ success: true }); // Don't break the frontend
     }
 });
 
 app.post('/query', async (req, res) => {
     const { visitor_id, prompt } = req.body;
     
+    // If no OpenAI key, return a helpful message
+    if (!process.env.OPENAI_API_KEY) {
+        return res.json({ 
+            answer: "SYSTEM: OpenAI API key not configured. Add OPENAI_API_KEY to Railway environment variables." 
+        });
+    }
+    
     try {
-        const visitorResult = await pool.query(
-            'SELECT * FROM visitors WHERE visitor_id = $1',
-            [visitor_id]
-        );
-        const visitor = visitorResult.rows[0];
+        // Lazy load OpenAI only when needed
+        const OpenAI = require('openai');
+        const openai = new OpenAI({
+            apiKey: process.env.OPENAI_API_KEY
+        });
         
-        const historyResult = await pool.query(
-            'SELECT prompt, answer FROM conversations WHERE visitor_id = $1 ORDER BY ts DESC LIMIT 5',
-            [visitor_id]
-        );
+        let systemPrompt = "You are an OSINT lab concierge helping researchers and investigators. ";
         
-        const systemPrompt = `You are an OSINT lab concierge helping researchers and investigators. You have access to visitor context:
-Location: ${visitor.city}, ${visitor.country}
-Coordinates: ${visitor.lat}, ${visitor.lon}
-First seen: ${visitor.first_seen}
-Previous conversations: ${historyResult.rows.length}
-
-Provide helpful, accurate information about OSINT tools, techniques, and methodologies. Be concise and terminal-appropriate.`;
+        // Add visitor context if database is available
+        if (pool) {
+            try {
+                const visitorResult = await pool.query(
+                    'SELECT * FROM visitors WHERE visitor_id = $1',
+                    [visitor_id]
+                );
+                const visitor = visitorResult.rows[0];
+                if (visitor) {
+                    systemPrompt += `Visitor from ${visitor.city}, ${visitor.country}. `;
+                }
+            } catch (err) {
+                console.log('Could not fetch visitor info:', err.message);
+            }
+        }
+        
+        systemPrompt += "Provide helpful, accurate information about OSINT tools, techniques, and methodologies. Be concise and terminal-appropriate.";
 
         const completion = await openai.chat.completions.create({
             model: 'gpt-3.5-turbo',
@@ -110,19 +118,32 @@ Provide helpful, accurate information about OSINT tools, techniques, and methodo
         
         const answer = completion.choices[0].message.content;
         
-        await pool.query(
-            'INSERT INTO conversations (visitor_id, prompt, answer) VALUES ($1, $2, $3)',
-            [visitor_id, prompt, answer]
-        );
+        // Store conversation if database is available
+        if (pool) {
+            try {
+                await pool.query(
+                    'INSERT INTO conversations (visitor_id, prompt, answer) VALUES ($1, $2, $3)',
+                    [visitor_id, prompt, answer]
+                );
+            } catch (err) {
+                console.log('Could not store conversation:', err.message);
+            }
+        }
         
         res.json({ answer });
     } catch (error) {
-        console.error(error);
-        res.status(500).json({ answer: 'Error processing request.' });
+        console.error('Query error:', error);
+        res.json({ 
+            answer: `ERROR: ${error.message}. Check your OpenAI API key.` 
+        });
     }
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`OSINT Lab Terminal running on port ${PORT}`);
+    console.log('Environment check:');
+    console.log('- PORT:', PORT);
+    console.log('- DATABASE_URL:', process.env.DATABASE_URL ? 'configured' : 'not configured');
+    console.log('- OPENAI_API_KEY:', process.env.OPENAI_API_KEY ? 'configured' : 'not configured');
 });
