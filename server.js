@@ -1,6 +1,6 @@
 const express = require('express');
 const { Pool } = require('pg');
-const Anthropic = require('@anthropic-ai/sdk');
+const OpenAI = require('openai');
 
 const app = express();
 app.use(express.json());
@@ -11,8 +11,8 @@ const pool = new Pool({
     ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
-const anthropic = new Anthropic({
-    apiKey: process.env.ANTHROPIC_API_KEY
+const openai = new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY
 });
 
 async function initDB() {
@@ -99,17 +99,16 @@ Previous conversations: ${historyResult.rows.length}
 
 Provide helpful, accurate information about OSINT tools, techniques, and methodologies. Be concise and terminal-appropriate.`;
 
-        const message = await anthropic.messages.create({
-            model: 'claude-3-haiku-20240307',
-            max_tokens: 500,
-            system: systemPrompt,
-            messages: [{
-                role: 'user',
-                content: prompt
-            }]
+        const completion = await openai.chat.completions.create({
+            model: 'gpt-3.5-turbo',
+            messages: [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: prompt }
+            ],
+            max_tokens: 500
         });
         
-        const answer = message.content[0].text;
+        const answer = completion.choices[0].message.content;
         
         await pool.query(
             'INSERT INTO conversations (visitor_id, prompt, answer) VALUES ($1, $2, $3)',
